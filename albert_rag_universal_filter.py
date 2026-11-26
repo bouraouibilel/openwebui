@@ -947,6 +947,12 @@ class Filter:
         if not isinstance(messages, list) or not messages:
             return body
 
+        # Ignorer les tâches de fond d'Open WebUI (titre, tags, suggestions, autocomplétion…)
+        for src in (metadata, body.get("metadata")):
+            if isinstance(src, dict) and src.get("task"):
+                self._log(f"Tâche de fond Open WebUI ignorée : {src.get('task')}")
+                return body
+
         # Copie superficielle : body n'est modifié qu'à la toute fin
         messages = [dict(m) if isinstance(m, dict) else m for m in messages]
 
