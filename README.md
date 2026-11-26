@@ -1,11 +1,11 @@
 # Open WebUI — Albert RAG & Outils Équipe (GDA, Wiki, GitLab)
 
-Ce dépôt regroupe la configuration Docker, les fonctions (Pipe & Filtre) et les outils Open WebUI permettant à l'équipe d'interroger :
+Ce dépôt regroupe la configuration Docker, les fonctions (Pipe & Filtre) et les outils asynchrones Open WebUI permettant à l'équipe d'interroger (avec **identifiants personnels par utilisateur** via `UserValves` et **confirmation interactive** avant toute écriture) :
 
-- **Albert API** (modèles LLM + RAG multi-collections avec routage intelligent et mémoire de document)
-- **GDA / MantisBT** (consultation, recherche multi-critères et ajout de commentaires sur tickets)
-- **Wiki / DokuWiki** (recherche et lecture de pages internes)
-- **GitLab** (récupération de code multi-modules et requêtes API v4)
+- **Albert API** (modèles LLM avec relais SSE complet / *function calling* natif + RAG multi-collections avec routage intelligent et mémoire du document actif)
+- **GDA / MantisBT** (consultation, recherche multi-critères paginée sans accents et ajout de commentaires avec confirmation)
+- **Wiki / DokuWiki** (recherche et lecture via `?do=export_raw` ou API JSON-RPC, pagination `offset`)
+- **GitLab** (récupération de code multi-modules, recherche plein texte `search_code` et requêtes API v4 avec confirmation sur les écritures)
 
 ## Documentation
 
@@ -25,11 +25,17 @@ Ce guide prêt à partager couvre :
 ├── docker-compose.yml                      # Déploiement Open WebUI
 ├── docs/
 │   └── GUIDE_EQUIPE.md                     # Documentation de prise en main à partager à l'équipe
+├── pipes/
+│   └── pipe_albert.py                      # Pipe (Manifold) des modèles text-generation Albert API (v2.0.0)
 ├── filtres/
-│   ├── pipe_albert.py                      # Pipe (Manifold) des modèles text-generation Albert API
-│   └── albert_rag_universal_filter.py      # Filtre RAG universel Albert (v2.8.0)
+│   └── albert_rag_universal_filter.py      # Filtre RAG universel Albert (v2.9.0)
 └── tools/
-    ├── gda_tool.py                         # Outil MantisBT / GDA (v2.1)
-    ├── wiki_search_tool.py                 # Outil DokuWiki (v2.4.0)
-    └── gitlab_code_fetcher.py              # Outil GitLab Code & API v4 (v2.1)
+    ├── gda_tool.py                         # Outil MantisBT / GDA (v3.0.0)
+    ├── wiki_search_tool.py                 # Outil DokuWiki (v3.0.0)
+    └── gitlab_code_fetcher.py              # Outil GitLab Code & API v4 (v3.0.0)
 ```
+
+## Notes clés (v2.9 / v3.0)
+
+- **Clés & jetons par utilisateur (`UserValves`)** : la clé Albert saisie une seule fois dans la Pipe (`API_KEY`) est automatiquement réutilisée par le filtre RAG. Chaque outil (GDA, GitLab, Wiki) utilise le jeton personnel de l'utilisateur (`ALLOW_ADMIN_*_FALLBACK=False` par défaut).
+- **Certificats internes (SSL)** : `VERIFY_SSL=True` par défaut. Pour des services internes avec CA d'entreprise, montez le certificat dans `docker-compose.yml` (`SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE`).

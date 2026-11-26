@@ -1,10 +1,12 @@
 """
 title: Albert RAG Universal Filter with Smart Multi-Collection Router
 author: Open WebUI Community
-description: Filtre RAG Albert multi-collections avec routage intelligent par mot-clé ou nom de document, mémoire du document actif par conversation, filtrage serveur par document_ids, budget de contexte et reranking dynamique asynchrone.
-version: 2.8.0
+description: Filtre RAG Albert multi-collections avec clé API par utilisateur (partagée avec pipe_albert), routage intelligent par mot-clé ou nom de document, mémoire du document actif par conversation, filtrage serveur par document_ids, budget de contexte et reranking dynamique asynchrone.
+version: 2.9.0
 """
 
+import hashlib
+import inspect
 import json
 import os
 import re
@@ -45,7 +47,7 @@ class Filter:
     GENERIC_NAME_TOKENS = {
         "guide", "document", "doc", "docs", "manuel", "procedure", "version",
         "final", "finale", "annexe", "fiche", "note", "notes", "rapport",
-        "pdf", "docx", "doc", "xlsx", "pptx", "txt", "md", "odt",
+        "pdf", "docx", "xlsx", "pptx", "txt", "md", "odt",
         "de", "du", "des", "la", "le", "les", "et", "en", "pour", "sur", "the",
         "and", "of", "v1", "v2", "v3", "copie", "draft",
     }
@@ -70,9 +72,21 @@ class Filter:
             default="https://albert.api.etalab.gouv.fr/v1",
             description="URL de base de l'API Albert",
         )
+        PIPE_FUNCTION_ID: str = Field(
+            default="",
+            description="ID de la fonction Pipe Albert (ex: 'pipe_albert') pour réutiliser automatiquement la clé API personnelle saisie par l'utilisateur. Laisser vide pour détection auto via le préfixe du modèle.",
+        )
         ALBERT_API_KEY: str = Field(
             default="",
-            description="Clé API Albert (sk-...)",
+            description="Clé API Albert admin (utilisée uniquement si ALLOW_ADMIN_KEY_FALLBACK=True)",
+        )
+        ALLOW_ADMIN_KEY_FALLBACK: bool = Field(
+            default=False,
+            description="Autoriser le repli sur la clé admin si l'utilisateur n'a pas saisi sa clé personnelle (False recommandé)",
+        )
+        VERIFY_SSL: bool = Field(
+            default=True,
+            description="Vérifier le certificat SSL de l'API Albert",
         )
         COLLECTION_ROUTING_JSON: str = Field(
             default=json.dumps(
@@ -108,8 +122,8 @@ class Filter:
             description="Nombre de questions précédentes analysées pour retrouver un document/projet si la mémoire est vide (ex : après redémarrage)",
         )
         SEARCH_METHOD: str = Field(
-            default="semantic",
-            description="Méthode de recherche Albert : 'semantic', 'lexical' ou 'hybrid' (hybrid recommandé pour les acronymes métier)",
+            default="hybrid",
+            description="Méthode de recherche Albert : 'hybrid' (recommandé pour les acronymes), 'semantic' ou 'lexical'",
         )
         ENABLE_RERANK: bool = Field(
             default=True,
@@ -148,15 +162,24 @@ class Filter:
             description="Durée de vie du cache des listes de documents par collection (en secondes)",
         )
 
+    class UserValves(BaseModel):
+        ALBERT_API_KEY: str = Field(
+            default="",
+            description="Votre clé API personnelle Albert (optionnelle ici si déjà saisie dans la Pipe Albert)",
+        )
+
     def __init__(self):
         self.valves = self.Valves()
-        self._doc_name_cache: Dict[str, str] = {}
-        self._collection_docs_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+        # Caches cloisonnés par empreinte de clé API pour ne jamais mélanger les droits entre utilisateurs
+        self._doc_name_cache: Dict[Tuple[str, str], str] = {}
+        self._collection_docs_cache: Dict[
+            Tuple[str, str], Tuple[float, List[Dict[str, Any]]]
+        ] = {}
         # Mémoire par conversation : chat_id -> état du projet/document actif
         self._chat_states: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ #
-    # Utilitaires
+    # Utilitaires & résolution de la clé API utilisateur
     # ------------------------------------------------------------------ #
 
     def _log(self, message: str) -> None:
@@ -166,19 +189,25 @@ class Filter:
     def _base_url(self) -> str:
         return self.valves.ALBERT_API_BASE_URL.rstrip("/")
 
-    def _get_headers(self) -> Dict[str, str]:
+    @staticmethod
+    def _key_scope(api_key: str) -> str:
+        return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+
+    def _get_headers(self, api_key: str) -> Dict[str, str]:
         return {
-            "Authorization": f"Bearer {self.valves.ALBERT_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
 
     def _make_client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0))
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            verify=self.valves.VERIFY_SSL,
+        )
 
     @staticmethod
     def _to_api_id(value: Any) -> Any:
-        """L'API Albert attend des IDs entiers ; on convertit quand c'est possible."""
         s = str(value).strip()
         return int(s) if s.isdigit() else s
 
@@ -191,6 +220,72 @@ class Filter:
             )
         except Exception as e:
             self._log(f"Erreur émission status : {e}")
+
+    async def _lookup_pipe_user_key(self, user_id: str, pipe_ids: List[str]) -> str:
+        """Lit la clé API personnelle saisie par l'utilisateur sur la Pipe Albert (une seule saisie)."""
+        if not user_id or not pipe_ids:
+            return ""
+        try:
+            from open_webui.models.functions import Functions
+        except Exception:
+            return ""
+
+        for pid in dict.fromkeys(p.strip() for p in pipe_ids if p and p.strip()):
+            try:
+                res = Functions.get_user_valves_by_id_and_user_id(pid, user_id)
+                if inspect.isawaitable(res):
+                    res = await res
+                if isinstance(res, dict):
+                    key = str(
+                        res.get("API_KEY") or res.get("ALBERT_API_KEY") or ""
+                    ).strip()
+                    if key:
+                        self._log(f"Clé API utilisateur récupérée depuis la Pipe '{pid}'.")
+                        return key
+            except Exception as e:
+                self._log(f"Impossible de lire UserValves sur '{pid}' : {e}")
+        return ""
+
+    async def _resolve_api_key(
+        self, body: dict, __user__: Optional[dict]
+    ) -> Tuple[str, str]:
+        """
+        Résout la clé Albert à utiliser pour cet appel.
+        Priorité :
+          1. UserValves du filtre lui-même (ALBERT_API_KEY)
+          2. UserValves de la Pipe Albert (API_KEY) pour éviter une double saisie
+          3. Valves admin (ALBERT_API_KEY) uniquement si ALLOW_ADMIN_KEY_FALLBACK=True
+        """
+        if isinstance(__user__, dict):
+            uv = __user__.get("valves")
+            if uv is not None:
+                direct_key = (
+                    uv.get("ALBERT_API_KEY", "")
+                    if isinstance(uv, dict)
+                    else getattr(uv, "ALBERT_API_KEY", "")
+                )
+                direct_key = str(direct_key or "").strip()
+                if direct_key:
+                    return direct_key, "user_filter"
+
+            user_id = str(__user__.get("id") or "").strip()
+            candidate_pipes: List[str] = []
+            if self.valves.PIPE_FUNCTION_ID.strip():
+                candidate_pipes.append(self.valves.PIPE_FUNCTION_ID.strip())
+            raw_model = str(body.get("model") or "")
+            if "." in raw_model:
+                candidate_pipes.append(raw_model.split(".", 1)[0])
+            candidate_pipes.extend(["pipe_albert", "albert"])
+
+            pipe_key = await self._lookup_pipe_user_key(user_id, candidate_pipes)
+            if pipe_key:
+                return pipe_key, "user_pipe"
+
+        if self.valves.ALLOW_ADMIN_KEY_FALLBACK and self.valves.ALBERT_API_KEY.strip():
+            self._log("Repli sur la clé API admin (ALLOW_ADMIN_KEY_FALLBACK=True).")
+            return self.valves.ALBERT_API_KEY.strip(), "admin_fallback"
+
+        return "", "missing"
 
     def _extract_text(self, content: Any) -> str:
         if isinstance(content, str):
@@ -234,20 +329,40 @@ class Filter:
             self._log(f"Erreur parsing JSON routes : {e}")
             return {}
 
-    def _find_matching_tool_name(self, tools: list, patterns: List[str]) -> str:
+    def _find_matching_tool_name(
+        self,
+        tools: list,
+        name_patterns: List[str],
+        desc_patterns: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Résout un nom d'outil sans faux positifs :
+        1. Cherche d'abord sur le NOM exact/spécifique de la fonction.
+        2. N'examine la description qu'en second recours avec des motifs dédiés.
+        """
         if not tools or not isinstance(tools, list):
             return ""
+
+        parsed: List[Tuple[str, str]] = []
         for t in tools:
             if not isinstance(t, dict):
                 continue
             fn = t.get("function", {}) if isinstance(t.get("function"), dict) else {}
-            fn_name = str(fn.get("name", ""))
-            fn_desc = str(fn.get("description", ""))
-            for p in patterns:
-                if re.search(p, fn_name, flags=re.IGNORECASE) or re.search(
-                    p, fn_desc, flags=re.IGNORECASE
-                ):
+            fn_name = str(fn.get("name", "")).strip()
+            fn_desc = str(fn.get("description", "")).strip()
+            if fn_name:
+                parsed.append((fn_name, fn_desc))
+
+        for p in name_patterns:
+            for fn_name, _ in parsed:
+                if re.search(p, fn_name, flags=re.IGNORECASE):
                     return fn_name
+
+        for p in desc_patterns or []:
+            for fn_name, fn_desc in parsed:
+                if re.search(p, fn_desc, flags=re.IGNORECASE):
+                    return fn_name
+
         return ""
 
     def _extract_doc_raw_name(self, doc: Any) -> str:
@@ -261,18 +376,17 @@ class Filter:
             or ""
         ).strip()
 
-    def _cache_doc_name(self, doc_id: str, name: str) -> None:
+    def _cache_doc_name(self, scope: str, doc_id: str, name: str) -> None:
         if len(self._doc_name_cache) > self.MAX_DOC_NAME_CACHE:
             self._doc_name_cache.clear()
-        self._doc_name_cache[doc_id] = name
+        self._doc_name_cache[(scope, doc_id)] = name
 
     # ------------------------------------------------------------------ #
-    # Mémoire par conversation (corrige la perte du document actif)
+    # Mémoire par conversation
     # ------------------------------------------------------------------ #
 
     def _get_chat_id(self, body: dict, metadata: Optional[dict]) -> Optional[str]:
-        candidates = [metadata, body.get("metadata")]
-        for src in candidates:
+        for src in (metadata, body.get("metadata")):
             if isinstance(src, dict) and src.get("chat_id"):
                 return str(src["chat_id"])
         if body.get("chat_id"):
@@ -316,26 +430,24 @@ class Filter:
     # ------------------------------------------------------------------ #
 
     async def _get_collection_documents(
-        self, client: httpx.AsyncClient, collection_id: str
+        self, client: httpx.AsyncClient, api_key: str, collection_id: str
     ) -> List[Dict[str, Any]]:
-        """
-        Liste paginée des documents d'une collection (cache TTL).
-        API Albert actuelle : GET /v1/documents?collection_id=X&limit=100&offset=N
-        (repli sur l'ancien GET /v1/collections/{id}/documents).
-        """
+        scope = self._key_scope(api_key)
+        cache_key = (scope, collection_id)
         now = time.time()
-        cached = self._collection_docs_cache.get(collection_id)
+        cached = self._collection_docs_cache.get(cache_key)
         if cached and now - cached[0] < self.valves.CACHE_TTL_SECONDS:
             return cached[1]
 
         docs: List[Dict[str, Any]] = []
         ok = False
         page_size = 100
+        headers = self._get_headers(api_key)
         try:
-            for page in range(20):  # 2000 documents max par collection
+            for page in range(20):
                 res = await client.get(
                     f"{self._base_url()}/documents",
-                    headers=self._get_headers(),
+                    headers=headers,
                     params={
                         "collection_id": self._to_api_id(collection_id),
                         "limit": page_size,
@@ -359,38 +471,39 @@ class Filter:
             if not ok:
                 res = await client.get(
                     f"{self._base_url()}/collections/{collection_id}/documents",
-                    headers=self._get_headers(),
+                    headers=headers,
                     timeout=8.0,
                 )
                 if res.status_code == 200:
                     ok = True
                     data = res.json()
-                    batch = (data.get("data") or data.get("results") or []) if isinstance(data, dict) else data
+                    batch = (
+                        (data.get("data") or data.get("results") or [])
+                        if isinstance(data, dict)
+                        else data
+                    )
                     docs = [d for d in batch if isinstance(d, dict)] if isinstance(batch, list) else []
         except Exception as e:
             self._log(f"Erreur récupération docs collection {collection_id} : {e}")
 
         if ok:
-            # On ne garde que les documents réellement rattachés à cette collection
             docs = [
                 d for d in docs
                 if d.get("collection_id") is None
                 or str(d.get("collection_id")) == str(collection_id)
             ]
-            self._collection_docs_cache[collection_id] = (now, docs)
+            self._collection_docs_cache[cache_key] = (now, docs)
             for d in docs:
                 if d.get("id") is not None:
                     raw_name = self._extract_doc_raw_name(d)
                     if raw_name:
-                        self._cache_doc_name(str(d["id"]), os.path.basename(raw_name))
+                        self._cache_doc_name(scope, str(d["id"]), os.path.basename(raw_name))
             self._log(f"Collection {collection_id} : {len(docs)} documents indexés en cache")
             return docs
 
-        # En cas d'échec, on ne met pas en cache pour réessayer au prochain tour
         return cached[1] if cached else []
 
     def _is_document_mentioned_in_query(self, raw_name: str, query: str) -> bool:
-        """Vérifie de façon robuste si un nom de document est mentionné dans la requête."""
         if not raw_name:
             return False
         q_clean = self._normalize_for_match(query)
@@ -402,11 +515,9 @@ class Filter:
         if len(name_clean) <= 4:
             return False
 
-        # 1. Nom complet normalisé présent dans la requête
         if name_clean in q_clean:
             return True
 
-        # 2. Préfixe significatif (hors préfixes génériques)
         if len(name_clean) > 10 and name_clean[:12] in q_clean:
             prefix = name_clean[:12]
             if not any(
@@ -415,7 +526,6 @@ class Filter:
             ):
                 return True
 
-        # 3. Tous les tokens significatifs du nom (>= 2) présents dans la requête
         name_tokens = [
             t for t in self._tokenize(name_no_ext)
             if len(t) >= 3 and t not in self.GENERIC_NAME_TOKENS
@@ -430,10 +540,10 @@ class Filter:
     async def _scan_documents(
         self,
         client: httpx.AsyncClient,
+        api_key: str,
         query: str,
         collection_ids: List[str],
     ) -> Tuple[List[str], List[str], List[str]]:
-        """Retourne (collections_concernées, doc_ids, doc_names) des documents cités dans la requête."""
         if len(self._normalize_for_match(query)) < 5:
             return [], [], []
 
@@ -442,7 +552,7 @@ class Filter:
         matched_doc_names: List[str] = []
 
         for cid in collection_ids:
-            docs = await self._get_collection_documents(client, cid)
+            docs = await self._get_collection_documents(client, api_key, cid)
             for d in docs:
                 raw_name = self._extract_doc_raw_name(d)
                 doc_id = str(d.get("id") or "")
@@ -461,7 +571,6 @@ class Filter:
     def _match_keywords_in_text(
         self, text: str, routes: Dict[str, str]
     ) -> Tuple[List[str], List[str]]:
-        """Recherche les mots-clés de projets dans un texte donné."""
         text_lower = text.lower()
         target_ids: List[str] = []
         matched_projects: List[str] = []
@@ -478,13 +587,15 @@ class Filter:
         return target_ids, matched_projects
 
     # ------------------------------------------------------------------ #
-    # Résolution de la cible (projet + document) pour le tour courant
+    # Résolution de la cible (projet + document)
     # ------------------------------------------------------------------ #
 
     def _is_followup(self, query: str) -> bool:
         return len(query.split()) <= 10 or bool(self.FOLLOWUP_REGEX.match(query.strip()))
 
-    def _build_search_query(self, latest: str, user_msgs: List[str], is_followup: bool) -> str:
+    def _build_search_query(
+        self, latest: str, user_msgs: List[str], is_followup: bool
+    ) -> str:
         latest_clean = self._strip_tags(latest) or latest
         if is_followup and len(user_msgs) > 1:
             prev = self._strip_tags(user_msgs[1])[:300]
@@ -504,7 +615,11 @@ class Filter:
         }
 
     async def _resolve_target(
-        self, client: httpx.AsyncClient, messages: list, chat_id: Optional[str]
+        self,
+        client: httpx.AsyncClient,
+        api_key: str,
+        messages: list,
+        chat_id: Optional[str],
     ) -> Optional[Dict[str, Any]]:
         routes = self._get_routes()
         if not routes:
@@ -531,7 +646,6 @@ class Filter:
         is_followup = self._is_followup(latest_clean or latest)
         search_query = self._build_search_query(latest, user_msgs, is_followup)
 
-        # 0. Réinitialisation explicite de la mémoire
         if self._has_tag(latest_lower, self.RESET_TAGS):
             self._log("Tag #reset : mémoire du document actif effacée.")
             self._clear_state(chat_id)
@@ -540,21 +654,24 @@ class Filter:
         else:
             state = self._get_state(chat_id)
 
-        # 1. #all / #tous
         if self._has_tag(latest_lower, self.ALL_TAGS):
-            target = self._make_target(all_cids, ["Toutes les collections"], [], [], "explicit", search_query)
+            target = self._make_target(
+                all_cids, ["Toutes les collections"], [], [], "explicit", search_query
+            )
             self._save_state(chat_id, target)
             return target
 
-        # 2. Document cité explicitement dans le message courant (le plus spécifique)
-        d_cids, d_ids, d_names = await self._scan_documents(client, latest, all_cids)
+        d_cids, d_ids, d_names = await self._scan_documents(
+            client, api_key, latest, all_cids
+        )
         if d_ids:
             labels = [cid_to_label.get(c, c) for c in d_cids]
-            target = self._make_target(d_cids, labels, d_ids, d_names, "explicit", latest_clean or latest)
+            target = self._make_target(
+                d_cids, labels, d_ids, d_names, "explicit", latest_clean or latest
+            )
             self._save_state(chat_id, target)
             return target
 
-        # 3. Mot-clé projet dans le message courant
         kw_ids, kw_labels = self._match_keywords_in_text(latest, routes)
         if kw_ids:
             keep_docs = bool(
@@ -574,40 +691,55 @@ class Filter:
             self._save_state(chat_id, target)
             return target
 
-        # 4. Mémoire de la conversation (document/projet actif)
         if state:
-            self._log(f"Réutilisation du contexte mémorisé : {state['labels']} / {state['doc_names']}")
-            target = self._make_target(
-                state["collection_ids"], state["labels"], state["doc_ids"],
-                state["doc_names"], "sticky", search_query,
+            self._log(
+                f"Réutilisation du contexte mémorisé : {state['labels']} / {state['doc_names']}"
             )
-            self._save_state(chat_id, target)  # rafraîchit le TTL
+            target = self._make_target(
+                state["collection_ids"],
+                state["labels"],
+                state["doc_ids"],
+                state["doc_names"],
+                "sticky",
+                search_query,
+            )
+            self._save_state(chat_id, target)
             return target
 
-        # 5. Pas de mémoire (nouveau process, chat temporaire…) : on relit l'historique
         for prev in user_msgs[1 : 1 + max(0, self.valves.HISTORY_SCAN_DEPTH)]:
-            p_cids, p_ids, p_names = await self._scan_documents(client, prev, all_cids)
+            p_cids, p_ids, p_names = await self._scan_documents(
+                client, api_key, prev, all_cids
+            )
             if p_ids:
                 labels = [cid_to_label.get(c, c) for c in p_cids]
-                target = self._make_target(p_cids, labels, p_ids, p_names, "history", search_query)
+                target = self._make_target(
+                    p_cids, labels, p_ids, p_names, "history", search_query
+                )
                 self._save_state(chat_id, target)
                 return target
             h_ids, h_labels = self._match_keywords_in_text(prev, routes)
             if h_ids:
-                target = self._make_target(h_ids, h_labels, [], [], "history", search_query)
+                target = self._make_target(
+                    h_ids, h_labels, [], [], "history", search_query
+                )
                 self._save_state(chat_id, target)
                 return target
 
-        # 6. Repli configuré
         fallback_key = self.valves.DEFAULT_FALLBACK_COLLECTION.strip().lower()
         if fallback_key and fallback_key in routes:
             return self._make_target(
-                [routes[fallback_key]], [fallback_key.upper()], [], [], "fallback", search_query
+                [routes[fallback_key]],
+                [fallback_key.upper()],
+                [],
+                [],
+                "fallback",
+                search_query,
             )
 
-        # 7. Recherche transversale
         if self.valves.AUTO_SEARCH_ALL_ON_UNKNOWN:
-            return self._make_target(all_cids, ["Multi-collections (Auto)"], [], [], "auto", search_query)
+            return self._make_target(
+                all_cids, ["Multi-collections (Auto)"], [], [], "auto", search_query
+            )
 
         return None
 
@@ -618,9 +750,11 @@ class Filter:
     async def _get_document_title(
         self,
         client: httpx.AsyncClient,
+        api_key: str,
         doc_id: str,
         item_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
+        scope = self._key_scope(api_key)
         if isinstance(item_metadata, dict):
             meta_name = (
                 item_metadata.get("document_name")
@@ -632,17 +766,19 @@ class Filter:
             if meta_name and str(meta_name).strip():
                 clean = os.path.basename(str(meta_name).strip())
                 if doc_id:
-                    self._cache_doc_name(doc_id, clean)
+                    self._cache_doc_name(scope, doc_id, clean)
                 return clean
 
         if not doc_id:
             return "Document sans nom"
-        if doc_id in self._doc_name_cache:
-            return self._doc_name_cache[doc_id]
+        if (scope, doc_id) in self._doc_name_cache:
+            return self._doc_name_cache[(scope, doc_id)]
 
         try:
             res = await client.get(
-                f"{self._base_url()}/documents/{doc_id}", headers=self._get_headers(), timeout=4.0
+                f"{self._base_url()}/documents/{doc_id}",
+                headers=self._get_headers(api_key),
+                timeout=4.0,
             )
             if res.status_code == 200:
                 doc_data = res.json()
@@ -651,18 +787,19 @@ class Filter:
                 )
                 if title:
                     clean = os.path.basename(title)
-                    self._cache_doc_name(doc_id, clean)
+                    self._cache_doc_name(scope, doc_id, clean)
                     return clean
         except Exception as e:
             self._log(f"Erreur récupération titre document {doc_id}: {e}")
 
         fallback = f"Document #{doc_id}"
-        self._cache_doc_name(doc_id, fallback)
+        self._cache_doc_name(scope, doc_id, fallback)
         return fallback
 
     async def _search(
         self,
         client: httpx.AsyncClient,
+        api_key: str,
         query: str,
         collection_ids: List[str],
         doc_ids: List[str],
@@ -684,14 +821,15 @@ class Filter:
         self._log(
             f"POST /search : query='{query[:60]}…' | collections={collection_ids} | docs={doc_ids} | limit={payload['limit']} | method={method}"
         )
+        headers = self._get_headers(api_key)
         res = await client.post(
-            f"{self._base_url()}/search", headers=self._get_headers(), json=payload, timeout=15.0
+            f"{self._base_url()}/search", headers=headers, json=payload, timeout=15.0
         )
         if res.status_code != 200 and method != "semantic":
             self._log(f"/search {method} HTTP {res.status_code}, nouvel essai en 'semantic'.")
             payload["method"] = "semantic"
             res = await client.post(
-                f"{self._base_url()}/search", headers=self._get_headers(), json=payload, timeout=15.0
+                f"{self._base_url()}/search", headers=headers, json=payload, timeout=15.0
             )
         if res.status_code != 200:
             self._log(f"Erreur /search HTTP {res.status_code}: {res.text[:300]}")
@@ -705,6 +843,7 @@ class Filter:
     async def _rerank_chunks(
         self,
         client: httpx.AsyncClient,
+        api_key: str,
         query: str,
         candidate_chunks: List[Dict[str, Any]],
         top_n: int,
@@ -720,10 +859,15 @@ class Filter:
         }
         try:
             res = await client.post(
-                f"{self._base_url()}/rerank", headers=self._get_headers(), json=payload, timeout=12.0
+                f"{self._base_url()}/rerank",
+                headers=self._get_headers(api_key),
+                json=payload,
+                timeout=12.0,
             )
             if res.status_code != 200:
-                self._log(f"Erreur /rerank {res.status_code}: {res.text[:300]}. Repli sur l'ordre initial.")
+                self._log(
+                    f"Erreur /rerank {res.status_code}: {res.text[:300]}. Repli sur l'ordre initial."
+                )
                 return candidate_chunks[:top_n]
 
             data = res.json()
@@ -739,14 +883,13 @@ class Filter:
                         reranked.append(chunk)
 
             reranked.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
-            # Si le seuil a tout éliminé, on garde au moins les meilleurs résultats initiaux
             return reranked[:top_n] if reranked else candidate_chunks[: min(3, top_n)]
         except Exception as e:
             self._log(f"Exception /rerank: {e}")
             return candidate_chunks[:top_n]
 
     async def _parse_results(
-        self, client: httpx.AsyncClient, raw_results: List[Any]
+        self, client: httpx.AsyncClient, api_key: str, raw_results: List[Any]
     ) -> List[Dict[str, Any]]:
         candidates: List[Dict[str, Any]] = []
         seen = set()
@@ -755,13 +898,18 @@ class Filter:
                 continue
             chunk_obj = item.get("chunk") if isinstance(item.get("chunk"), dict) else {}
             metadata_obj = (
-                chunk_obj.get("metadata") if isinstance(chunk_obj.get("metadata"), dict)
-                else item.get("metadata") if isinstance(item.get("metadata"), dict)
+                chunk_obj.get("metadata")
+                if isinstance(chunk_obj.get("metadata"), dict)
+                else item.get("metadata")
+                if isinstance(item.get("metadata"), dict)
                 else {}
             )
             text = (
-                chunk_obj.get("content") or chunk_obj.get("text")
-                or item.get("content") or item.get("text") or ""
+                chunk_obj.get("content")
+                or chunk_obj.get("text")
+                or item.get("content")
+                or item.get("text")
+                or ""
             )
             if not (isinstance(text, str) and text.strip()):
                 continue
@@ -771,21 +919,25 @@ class Filter:
             seen.add(clean_text)
 
             doc_id = str(
-                chunk_obj.get("document_id") or item.get("document_id")
-                or metadata_obj.get("document_id") or ""
+                chunk_obj.get("document_id")
+                or item.get("document_id")
+                or metadata_obj.get("document_id")
+                or ""
             )
             candidates.append(
                 {
                     "text": clean_text,
                     "doc_id": doc_id,
-                    "doc_title": await self._get_document_title(client, doc_id, metadata_obj),
+                    "doc_title": await self._get_document_title(
+                        client, api_key, doc_id, metadata_obj
+                    ),
                     "initial_score": item.get("score", 0.0),
                 }
             )
         return candidates
 
     async def _fetch_albert_context(
-        self, client: httpx.AsyncClient, target: Dict[str, Any]
+        self, client: httpx.AsyncClient, api_key: str, target: Dict[str, Any]
     ) -> Tuple[List[str], List[Dict[str, Any]]]:
         collection_ids = target["collection_ids"]
         doc_ids = target["doc_ids"]
@@ -795,24 +947,36 @@ class Filter:
         top_k = self.valves.TOP_K_TARGETED_DOC if doc_ids else self.valves.TOP_K
 
         try:
-            raw = await self._search(client, query, collection_ids, doc_ids, limit)
-            candidates = await self._parse_results(client, raw)
+            raw = await self._search(
+                client, api_key, query, collection_ids, doc_ids, limit
+            )
+            candidates = await self._parse_results(client, api_key, raw)
 
             if doc_ids:
-                # Filet de sécurité si l'API ignore document_ids
                 filtered = [c for c in candidates if c["doc_id"] in doc_ids]
                 if filtered:
                     candidates = filtered
                 elif not candidates:
-                    self._log("Aucun résultat dans le document ciblé, élargissement à la collection.")
-                    raw = await self._search(client, query, collection_ids, [], self.valves.RETRIEVAL_LIMIT)
-                    candidates = await self._parse_results(client, raw)
+                    self._log(
+                        "Aucun résultat dans le document ciblé, élargissement à la collection."
+                    )
+                    raw = await self._search(
+                        client,
+                        api_key,
+                        query,
+                        collection_ids,
+                        [],
+                        self.valves.RETRIEVAL_LIMIT,
+                    )
+                    candidates = await self._parse_results(client, api_key, raw)
 
             if not candidates:
                 return [], []
 
             if self.valves.ENABLE_RERANK:
-                final_chunks = await self._rerank_chunks(client, query, candidates, top_k)
+                final_chunks = await self._rerank_chunks(
+                    client, api_key, query, candidates, top_k
+                )
             else:
                 final_chunks = candidates[:top_k]
 
@@ -827,7 +991,9 @@ class Filter:
                     if not formatted:
                         block = block[:budget]
                     else:
-                        self._log(f"Budget de contexte atteint ({used} car.), extraits restants ignorés.")
+                        self._log(
+                            f"Budget de contexte atteint ({used} car.), extraits restants ignorés."
+                        )
                         break
                 formatted.append(block)
                 used += len(block)
@@ -842,7 +1008,9 @@ class Filter:
                     {
                         "source": c["doc_title"],
                         "doc_id": c["doc_id"],
-                        "score": round(float(score), 4) if isinstance(score, (int, float)) else score,
+                        "score": round(float(score), 4)
+                        if isinstance(score, (int, float))
+                        else score,
                     }
                 )
 
@@ -870,12 +1038,17 @@ class Filter:
         n = self.valves.MAX_HISTORY_MESSAGES
         if n <= 0:
             return messages
-        system_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
-        others = [m for m in messages if not (isinstance(m, dict) and m.get("role") == "system")]
+        system_msgs = [
+            m for m in messages if isinstance(m, dict) and m.get("role") == "system"
+        ]
+        others = [
+            m
+            for m in messages
+            if not (isinstance(m, dict) and m.get("role") == "system")
+        ]
         if len(others) <= n:
             return messages
         kept = others[-n:]
-        # Ne jamais commencer par une réponse d'outil / d'assistant orpheline
         while kept and isinstance(kept[0], dict) and kept[0].get("role") != "user":
             kept.pop(0)
         if not kept:
@@ -895,10 +1068,42 @@ class Filter:
         return text.strip()
 
     def _build_tool_rules(self, clean_lower: str, available_tools: list) -> List[str]:
-        gitlab_fn = self._find_matching_tool_name(available_tools, [r"gitlab", r"code", r"repo", r"git"])
-        wiki_fn = self._find_matching_tool_name(available_tools, [r"wiki", r"search", r"confluence", r"doc"])
-        gda_get_fn = self._find_matching_tool_name(available_tools, [r"get_ticket", r"read_ticket", r"view_issue"])
-        gda_search_fn = self._find_matching_tool_name(available_tools, [r"search_issues", r"mantis_search", r"gda_search"])
+        """Résolution fiable des noms d'outils sans confusion entre Mantis, GitLab et Wiki."""
+        gitlab_file_fn = self._find_matching_tool_name(
+            available_tools,
+            name_patterns=[r"^get_file_content$", r"gitlab.*file", r"file_content"],
+            desc_patterns=[r"gitlab"],
+        )
+        gitlab_search_fn = self._find_matching_tool_name(
+            available_tools,
+            name_patterns=[r"^search_code$", r"gitlab.*search"],
+            desc_patterns=[r"gitlab.*(code|blob)"],
+        )
+        gitlab_api_fn = self._find_matching_tool_name(
+            available_tools,
+            name_patterns=[r"^gitlab_api_request$", r"gitlab"],
+            desc_patterns=[r"api.*gitlab"],
+        )
+        wiki_search_fn = self._find_matching_tool_name(
+            available_tools,
+            name_patterns=[r"^search_wiki$", r"wiki.*search", r"confluence"],
+            desc_patterns=[r"dokuwiki|wiki"],
+        )
+        wiki_read_fn = self._find_matching_tool_name(
+            available_tools,
+            name_patterns=[r"^read_page$", r"wiki.*read", r"get_page"],
+            desc_patterns=[r"dokuwiki.*page"],
+        )
+        gda_get_fn = self._find_matching_tool_name(
+            available_tools,
+            name_patterns=[r"^get_ticket$", r"read_ticket", r"view_issue"],
+            desc_patterns=[r"ticket mantis.*id"],
+        )
+        gda_search_fn = self._find_matching_tool_name(
+            available_tools,
+            name_patterns=[r"^search_issues$", r"mantis_search", r"gda_search"],
+            desc_patterns=[r"tickets? mantis"],
+        )
 
         rules = []
         id_match = re.search(
@@ -913,13 +1118,28 @@ class Filter:
                 f"- Dès que les informations sont obtenues, rédige directement la synthèse sans faire d'autres appels."
             )
         elif re.search(r"\b(gda|mantis|tickets?)\b", clean_lower):
-            rules.append(f"- Pour rechercher des tickets correspondants, appelle la fonction `{gda_search_fn or 'search_issues'}`.")
+            rules.append(
+                f"- Pour rechercher des tickets correspondants, appelle la fonction `{gda_search_fn or 'search_issues'}`."
+            )
 
-        if re.search(r"\b(gitlab|code|repo|dépôt|branche|commit|tag)\b", clean_lower):
-            rules.append(f"- Pour inspecter le dépôt, les branches ou les tags, appelle la fonction `{gitlab_fn or 'l outil GitLab'}`.")
+        if re.search(
+            r"\b(gitlab|code|repo|dépôt|branche|commit|tag|classe|fichier\s+source)\b",
+            clean_lower,
+        ):
+            fn_list = [f for f in (gitlab_file_fn, gitlab_search_fn, gitlab_api_fn) if f]
+            if fn_list:
+                fns_str = ", ".join(f"`{f}`" for f in dict.fromkeys(fn_list))
+                rules.append(
+                    f"- Pour inspecter le dépôt, les fichiers, le code, les branches ou les tags GitLab, utilise {fns_str}."
+                )
 
-        if re.search(r"\b(wiki|documentation|confluence|page\s+wiki)\b", clean_lower):
-            rules.append(f"- Pour consulter la documentation Wiki, appelle la fonction `{wiki_fn or 'l outil Wiki'}`.")
+        if re.search(r"\b(wiki|dokuwiki|confluence|page\s+wiki)\b", clean_lower):
+            fn_list = [f for f in (wiki_search_fn, wiki_read_fn) if f]
+            if fn_list:
+                fns_str = ", ".join(f"`{f}`" for f in dict.fromkeys(fn_list))
+                rules.append(
+                    f"- Pour consulter la documentation Wiki, utilise {fns_str}."
+                )
         return rules
 
     async def inlet(
@@ -931,9 +1151,11 @@ class Filter:
     ) -> dict:
         """Point d'entrée protégé : une erreur du filtre ne doit jamais faire planter le chat."""
         try:
-            return await self._inlet_impl(body, __event_emitter__, __metadata__)
+            return await self._inlet_impl(body, __user__, __event_emitter__, __metadata__)
         except Exception as e:
-            self._log(f"ERREUR INLET (le message part sans RAG) : {e}\n{traceback.format_exc()}")
+            self._log(
+                f"ERREUR INLET (le message part sans RAG) : {e}\n{traceback.format_exc()}"
+            )
             await self._emit_status(
                 __event_emitter__,
                 f"⚠️ Filtre Albert : erreur interne ({type(e).__name__}), réponse sans extraits RAG.",
@@ -941,7 +1163,9 @@ class Filter:
             )
             return body
 
-    async def _inlet_impl(self, body: dict, emitter, metadata: Optional[dict]) -> dict:
+    async def _inlet_impl(
+        self, body: dict, __user__: Optional[dict], emitter, metadata: Optional[dict]
+    ) -> dict:
         self._log("=== [INLET] Début de traitement ===")
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -953,7 +1177,6 @@ class Filter:
                 self._log(f"Tâche de fond Open WebUI ignorée : {src.get('task')}")
                 return body
 
-        # Copie superficielle : body n'est modifié qu'à la toute fin
         messages = [dict(m) if isinstance(m, dict) else m for m in messages]
 
         last_user_msg = ""
@@ -970,9 +1193,6 @@ class Filter:
         is_tool_turn = self._is_current_turn_tool_resolution(messages)
         self._log(f"chat_id={chat_id} | tool_turn={is_tool_turn}")
 
-        if not self.valves.ALBERT_API_KEY.strip():
-            self._log("ATTENTION : ALBERT_API_KEY non renseignée dans les Valves.")
-
         instructions = [
             "Tu es un assistant technique expert. Tu réponds TOUJOURS en français.",
             "RÈGLE D'INDÉPENDANCE DES SOURCES :",
@@ -987,56 +1207,86 @@ class Filter:
             if tool_rules:
                 instructions.append("CONSIGNES OUTILS :\n" + "\n".join(tool_rules))
 
-        if not is_tool_turn and self.valves.ALBERT_API_KEY.strip():
-            async with self._make_client() as client:
-                target = await self._resolve_target(client, messages, chat_id)
-                if target and target["collection_ids"]:
-                    projets_str = ", ".join(target["labels"]) or "Albert"
-                    docs_str = ", ".join(target["doc_names"])
-                    scope = f"{projets_str} › {docs_str}" if docs_str else projets_str
-                    self._log(f"Cible [{target['source']}] : {scope}")
+        if not is_tool_turn:
+            api_key, key_source = await self._resolve_api_key(body, __user__)
+            self._log(f"Source clé Albert : {key_source}")
 
-                    if docs_str:
-                        instructions.append(
-                            "CONTEXTE DE TRAVAIL ACTIF :\n"
-                            f"- Projet(s) : {projets_str}\n"
-                            f"- Document(s) étudié(s) : {docs_str}\n"
-                            "- Sauf indication contraire de l'utilisateur, ses questions portent sur ce(s) document(s)."
-                        )
+            if not api_key:
+                await self._emit_status(
+                    emitter,
+                    "⚠️ Clé API Albert personnelle non renseignée (Paramètres -> Fonctions) : RAG désactivé.",
+                    True,
+                )
+            else:
+                async with self._make_client() as client:
+                    target = await self._resolve_target(client, api_key, messages, chat_id)
+                    if target and target["collection_ids"]:
+                        projets_str = ", ".join(target["labels"]) or "Albert"
+                        docs_str = ", ".join(target["doc_names"])
+                        scope = f"{projets_str} › {docs_str}" if docs_str else projets_str
+                        self._log(f"Cible [{target['source']}] : {scope}")
 
-                    await self._emit_status(emitter, f"🔎 Recherche Albert ({scope})…", False)
-                    chunks, citations = await self._fetch_albert_context(client, target)
+                        if docs_str:
+                            instructions.append(
+                                "CONTEXTE DE TRAVAIL ACTIF :\n"
+                                f"- Projet(s) : {projets_str}\n"
+                                f"- Document(s) étudié(s) : {docs_str}\n"
+                                "- Sauf indication contraire de l'utilisateur, ses questions portent sur ce(s) document(s)."
+                            )
 
-                    if chunks:
-                        unique_docs = [c["source"]["name"] for c in citations]
-                        instructions.append(
-                            f"--- EXTRAITS DOCUMENTS ALBERT RAG ({projets_str}) ---\n"
-                            + "\n\n---\n\n".join(chunks)
-                            + "\n--- FIN DES EXTRAITS DOCUMENTS ---\n\n"
-                            + "DOCUMENTS RAG DISPONIBLES :\n"
-                            + "\n".join(f"- 📄 {d}" for d in unique_docs)
-                        )
-                        if emitter:
-                            for citation in citations:
-                                try:
-                                    await emitter({"type": "citation", "data": citation})
-                                except Exception as e:
-                                    self._log(f"Erreur émission citation : {e}")
-                        hint = " · 📌 mémorisé (#reset pour changer)" if target["source"] in ("sticky", "history") or docs_str else ""
                         await self._emit_status(
-                            emitter,
-                            f"{len(chunks)} extraits injectés ({len(unique_docs)} doc) depuis {scope}{hint}",
-                            True,
+                            emitter, f"🔎 Recherche Albert ({scope})…", False
                         )
-                    else:
-                        await self._emit_status(emitter, f"Aucun extrait pertinent trouvé ({scope}).", True)
+                        chunks, citations = await self._fetch_albert_context(
+                            client, api_key, target
+                        )
+
+                        if chunks:
+                            unique_docs = [c["source"]["name"] for c in citations]
+                            instructions.append(
+                                f"--- EXTRAITS DOCUMENTS ALBERT RAG ({projets_str}) ---\n"
+                                + "\n\n---\n\n".join(chunks)
+                                + "\n--- FIN DES EXTRAITS DOCUMENTS ---\n\n"
+                                + "DOCUMENTS RAG DISPONIBLES :\n"
+                                + "\n".join(f"- 📄 {d}" for d in unique_docs)
+                            )
+                            if emitter:
+                                for citation in citations:
+                                    try:
+                                        await emitter(
+                                            {"type": "citation", "data": citation}
+                                        )
+                                    except Exception as e:
+                                        self._log(f"Erreur émission citation : {e}")
+                            hint = (
+                                " · 📌 mémorisé (#reset pour changer)"
+                                if target["source"] in ("sticky", "history") or docs_str
+                                else ""
+                            )
+                            await self._emit_status(
+                                emitter,
+                                f"{len(chunks)} extraits injectés ({len(unique_docs)} doc) depuis {scope}{hint}",
+                                True,
+                            )
+                        else:
+                            await self._emit_status(
+                                emitter,
+                                f"Aucun extrait pertinent trouvé ({scope}).",
+                                True,
+                            )
 
         injected_block = (
-            f"{self.FILTER_BLOCK_START}\n" + "\n\n".join(instructions) + f"\n{self.FILTER_BLOCK_END}"
+            f"{self.FILTER_BLOCK_START}\n"
+            + "\n\n".join(instructions)
+            + f"\n{self.FILTER_BLOCK_END}"
         )
 
         system_idx = next(
-            (i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "system"),
+            (
+                i
+                for i, m in enumerate(messages)
+                if isinstance(m, dict) and m.get("role") == "system"
+            ),
             None,
         )
         if system_idx is not None:
