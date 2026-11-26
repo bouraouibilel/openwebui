@@ -38,4 +38,4 @@ Ce guide prêt à partager couvre :
 ## Notes clés (v2.9 / v3.0)
 
 - **Clés & jetons par utilisateur (`UserValves`)** : la clé Albert saisie une seule fois dans la Pipe (`API_KEY`) est automatiquement réutilisée par le filtre RAG. Chaque outil (GDA, GitLab, Wiki) utilise le jeton personnel de l'utilisateur (`ALLOW_ADMIN_*_FALLBACK=False` par défaut).
-- **Certificats internes (SSL)** : `VERIFY_SSL=True` par défaut. Pour des services internes avec CA d'entreprise, montez le certificat dans `docker-compose.yml` (`SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE`).
+- **Certificats internes (SSL)** : `VERIFY_SSL=False` par défaut sur les outils internes (GDA, GitLab, Wiki), et `VERIFY_SSL=True` sur Albert API (modifiable dans les Valves). Si vous montez une CA interne (`SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE`), vous pouvez repasser `VERIFY_SSL=True`.

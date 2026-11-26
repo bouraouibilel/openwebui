@@ -38,8 +38,8 @@ class Tools:
             description="Autoriser le repli sur le cookie admin si l'utilisateur n'a pas saisi ses identifiants personnels (False recommandé)",
         )
         VERIFY_SSL: bool = Field(
-            default=True,
-            description="Vérifier le certificat SSL (monter la CA interne dans le conteneur plutôt que mettre False)",
+            default=False,
+            description="Vérifier le certificat SSL (False par défaut pour les instances internes sans CA montée)",
         )
         MAX_OUTPUT_CHARS: int = Field(
             default=6000,
