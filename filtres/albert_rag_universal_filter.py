@@ -2,7 +2,7 @@
 title: Albert RAG Universal Filter with Smart Multi-Collection Router
 author: Open WebUI Community
 description: Filtre RAG Albert multi-collections avec clé API par utilisateur (partagée avec pipe_albert), routage intelligent par mot-clé ou nom de document, mémoire du document actif par conversation, filtrage serveur par document_ids, budget de contexte et reranking dynamique asynchrone.
-version: 2.9.0
+version: 2.9.1
 """
 
 import hashlib
@@ -1067,6 +1067,19 @@ class Filter:
         )
         return text.strip()
 
+    @staticmethod
+    def _tools_enabled(body: dict, metadata: Optional[dict]) -> bool:
+        """Vrai si des outils sont activés pour ce chat.
+
+        À l'inlet, Open WebUI n'a pas encore résolu body["tools"] : les outils
+        sélectionnés sont visibles via `tool_ids` (body ou metadata)."""
+        if body.get("tools"):
+            return True
+        for src in (body, body.get("metadata"), metadata):
+            if isinstance(src, dict) and src.get("tool_ids"):
+                return True
+        return False
+
     def _build_tool_rules(self, clean_lower: str, available_tools: list) -> List[str]:
         """Résolution fiable des noms d'outils sans confusion entre Mantis, GitLab et Wiki."""
         gitlab_file_fn = self._find_matching_tool_name(
@@ -1127,6 +1140,9 @@ class Filter:
             clean_lower,
         ):
             fn_list = [f for f in (gitlab_file_fn, gitlab_search_fn, gitlab_api_fn) if f]
+            # À l'inlet, Open WebUI n'a pas encore résolu body["tools"] : noms par défaut.
+            if not fn_list:
+                fn_list = ["search_code", "get_file_content", "gitlab_api_request"]
             if fn_list:
                 fns_str = ", ".join(f"`{f}`" for f in dict.fromkeys(fn_list))
                 rules.append(
@@ -1135,6 +1151,8 @@ class Filter:
 
         if re.search(r"\b(wiki|dokuwiki|confluence|page\s+wiki)\b", clean_lower):
             fn_list = [f for f in (wiki_search_fn, wiki_read_fn) if f]
+            if not fn_list:
+                fn_list = ["search_wiki", "read_page"]
             if fn_list:
                 fns_str = ", ".join(f"`{f}`" for f in dict.fromkeys(fn_list))
                 rules.append(
@@ -1202,7 +1220,7 @@ class Filter:
             "- Lorsque tu utilises les extraits RAG, cite explicitement le nom du document source.",
         ]
 
-        if not is_tool_turn:
+        if not is_tool_turn and self._tools_enabled(body, metadata):
             tool_rules = self._build_tool_rules(clean_lower, body.get("tools") or [])
             if tool_rules:
                 instructions.append("CONSIGNES OUTILS :\n" + "\n".join(tool_rules))

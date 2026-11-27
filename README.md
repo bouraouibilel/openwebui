@@ -28,9 +28,9 @@ Ce guide prêt à partager couvre :
 ├── pipes/
 │   └── pipe_albert.py                      # Pipe (Manifold) des modèles text-generation Albert API (v2.0.0)
 ├── filtres/
-│   └── albert_rag_universal_filter.py      # Filtre RAG universel Albert (v2.9.0)
+│   └── albert_rag_universal_filter.py      # Filtre RAG universel Albert (v2.9.1)
 └── tools/
-    ├── gda_tool.py                         # Outil MantisBT / GDA (v3.0.0)
+    ├── gda_tool.py                         # Outil MantisBT / GDA (v3.0.1)
     ├── wiki_search_tool.py                 # Outil DokuWiki (v3.0.0)
     └── gitlab_code_fetcher.py              # Outil GitLab Code & API v4 (v3.0.0)
 ```

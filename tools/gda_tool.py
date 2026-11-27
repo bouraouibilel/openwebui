@@ -1,11 +1,12 @@
 """
 title: MantisBT Advanced Search & Management
 author: Assistant
-version: 3.0.0
+version: 3.0.1
 license: MIT
 description: Consultation asynchrone, recherche avancée multi-critères (sans accents, scoring, pagination) et ajout de notes avec confirmation utilisateur et jeton personnel sur MantisBT.
 """
 
+import re
 import unicodedata
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -79,6 +80,12 @@ class Tools:
         if self.valves.ALLOW_ADMIN_TOKEN_FALLBACK and self.valves.MANTIS_API_TOKEN.strip():
             return self.valves.MANTIS_API_TOKEN.strip()
         return ""
+
+    @staticmethod
+    def _parse_issue_id(issue_id: Any) -> Optional[int]:
+        """Accepte 45380, "45380", "#45380", "GDA-45380"… et renvoie l'entier, ou None."""
+        digits = re.sub(r"\D", "", str(issue_id or ""))
+        return int(digits) if digits else None
 
     def _missing_token_msg(self) -> str:
         return (
@@ -361,11 +368,16 @@ class Tools:
 
         :param issue_id: L'identifiant numérique du ticket (ex: 45380).
         """
+        parsed_id = self._parse_issue_id(issue_id)
+        if parsed_id is None:
+            return f"❌ Identifiant de ticket invalide : {issue_id!r} (attendu : un numéro, ex. 45380)."
+        issue_id = parsed_id
+
         token = self._resolve_token(__user__)
         if not token:
             return self._missing_token_msg()
 
-        url = f"{self.valves.MANTIS_REST_URL.rstrip('/')}/issues/{int(issue_id)}"
+        url = f"{self.valves.MANTIS_REST_URL.rstrip('/')}/issues/{issue_id}"
         await self._emit_status(
             __event_emitter__, f"🔎 Lecture du ticket Mantis #{issue_id}…", False
         )
@@ -470,6 +482,11 @@ class Tools:
         if not self.valves.ALLOW_WRITE:
             return "🚫 L'écriture sur Mantis est désactivée par l'administrateur (`ALLOW_WRITE=False`)."
 
+        parsed_id = self._parse_issue_id(issue_id)
+        if parsed_id is None:
+            return f"❌ Identifiant de ticket invalide : {issue_id!r} (attendu : un numéro, ex. 45380)."
+        issue_id = parsed_id
+
         token = self._resolve_token(__user__)
         if not token:
             return self._missing_token_msg()
@@ -498,7 +515,7 @@ class Tools:
         if approved is not True:
             return f"❎ Publication annulée par l'utilisateur pour le ticket #{issue_id}."
 
-        url = f"{self.valves.MANTIS_REST_URL.rstrip('/')}/issues/{int(issue_id)}/notes"
+        url = f"{self.valves.MANTIS_REST_URL.rstrip('/')}/issues/{issue_id}/notes"
         payload = {"text": preview, "view_state": {"name": vs}}
         await self._emit_status(
             __event_emitter__, f"✍️ Publication sur Mantis #{issue_id}…", False
